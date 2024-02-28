@@ -10,4 +10,4 @@ clean:
 .PHONY: all
 
 tig: tig.c
-
+	gcc -o tig tig.c -lncurses
