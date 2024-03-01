@@ -57,8 +57,6 @@ struct ref {
 	unsigned int next:1;	/* For ref lists: are there more refs? */
 };
 
-static struct ref **get_refs(char *id);
-
 struct int_map {
 	const char *name;
 	int namelen;
@@ -339,15 +337,6 @@ static struct view_ops main_ops;
 
 #define VIEW_STR(name, cmd, env, ref, ops) { name, cmd, #env, ref, ops }
 #define VIEW_(id, name, ops, ref) VIEW_STR(name, TIG_##id##_CMD,  TIG_##id##_CMD, ref, ops)
-
-static struct view views[] = {
-	VIEW_(MAIN,  "main",  &main_ops,  ref_head),
-	VIEW_(DIFF,  "diff",  &pager_ops, ref_commit),
-	VIEW_(LOG,   "log",   &pager_ops, ref_head),
-	VIEW_(HELP,  "help",  &pager_ops, "static"),
-};
-
-#define VIEW(req) (&views[(req) - REQ_OFFSET - 1])
 
 static bool draw_view_line(struct view *view, unsigned int lineno)
 {
@@ -831,6 +820,57 @@ enum open_flags {
 	OPEN_RELOAD = 4,	/* Reload view even if it is the current. */
 };
 
+static struct ref *refs;
+static size_t refs_size;
+
+static struct ref ***id_refs; /* Id <-> ref store */
+static size_t id_refs_size;
+
+static struct ref** get_refs(char *id)
+{
+	struct ref ***tmp_id_refs;
+	struct ref **ref_list = NULL;
+	size_t ref_list_size = 0;
+	size_t i;
+
+	for (i = 0; i < id_refs_size; i++)
+		if (!strcmp(id, id_refs[i][0]->id))
+			return id_refs[i];
+
+	tmp_id_refs = realloc(id_refs, (id_refs_size + 1) * sizeof(*id_refs));
+	if (!tmp_id_refs)
+		return NULL;
+
+	id_refs = tmp_id_refs;
+
+	for (i = 0; i < refs_size; i++) {
+		struct ref **tmp;
+
+		if (strcmp(id, refs[i].id))
+			continue;
+
+		tmp = realloc(ref_list, (ref_list_size + 1) * sizeof(*ref_list));
+		if (!tmp) {
+			if (ref_list)
+				free(ref_list);
+			return NULL;
+		}
+
+		ref_list = tmp;
+		if (ref_list_size > 0)
+			ref_list[ref_list_size - 1]->next = 1;
+		ref_list[ref_list_size] = &refs[i];
+
+		ref_list[ref_list_size]->next = 0;
+		ref_list_size++;
+	}
+
+	if (ref_list)
+		id_refs[id_refs_size++] = ref_list;
+
+	return ref_list;
+}
+
 static void add_pager_refs(struct view *view, struct line *line)
 {
 	char buf[1024];
@@ -866,6 +906,14 @@ static void add_pager_refs(struct view *view, struct line *line)
 	view->lines++;
 }
 
+static struct view views[] = {
+	VIEW_(MAIN,  "main",  &main_ops,  ref_head),
+	VIEW_(DIFF,  "diff",  &pager_ops, ref_commit),
+	VIEW_(LOG,   "log",   &pager_ops, ref_head),
+	VIEW_(HELP,  "help",  &pager_ops, "static"),
+};
+
+#define VIEW(req) (&views[(req) - REQ_OFFSET - 1])
 static bool pager_read(struct view *view, char *data)
 {
 	struct line *line = &view->line[view->lines];
@@ -1111,6 +1159,7 @@ static void open_view(struct view *prev, enum request request, enum open_flags f
 	if (backgrounded) /* If the view is backgrounded the above calls to report() won't redraw the view title. */
 		update_view_title(view);
 }
+
 
 static int view_driver(struct view *view, enum request request)
 {
@@ -1736,143 +1785,6 @@ static void init_display(void)
 	wbkgdset(status_win, get_line_attr(LINE_STATUS));
 }
 
-static struct ref *refs;
-static size_t refs_size;
-
-static struct ref ***id_refs; /* Id <-> ref store */
-static size_t id_refs_size;
-
-static struct ref** get_refs(char *id)
-{
-	struct ref ***tmp_id_refs;
-	struct ref **ref_list = NULL;
-	size_t ref_list_size = 0;
-	size_t i;
-
-	for (i = 0; i < id_refs_size; i++)
-		if (!strcmp(id, id_refs[i][0]->id))
-			return id_refs[i];
-
-	tmp_id_refs = realloc(id_refs, (id_refs_size + 1) * sizeof(*id_refs));
-	if (!tmp_id_refs)
-		return NULL;
-
-	id_refs = tmp_id_refs;
-
-	for (i = 0; i < refs_size; i++) {
-		struct ref **tmp;
-
-		if (strcmp(id, refs[i].id))
-			continue;
-
-		tmp = realloc(ref_list, (ref_list_size + 1) * sizeof(*ref_list));
-		if (!tmp) {
-			if (ref_list)
-				free(ref_list);
-			return NULL;
-		}
-
-		ref_list = tmp;
-		if (ref_list_size > 0)
-			ref_list[ref_list_size - 1]->next = 1;
-		ref_list[ref_list_size] = &refs[i];
-
-		ref_list[ref_list_size]->next = 0;
-		ref_list_size++;
-	}
-
-	if (ref_list)
-		id_refs[id_refs_size++] = ref_list;
-
-	return ref_list;
-}
-
-static int read_ref(char *id, int idlen, char *name, int namelen)
-{
-	struct ref *ref;
-	bool tag = FALSE;
-
-	if (!strncmp(name, "refs/tags/", STRING_SIZE("refs/tags/"))) {
-		if (name[namelen - 1] != '}')/* Commits referenced by tags has "^{}" appended. */
-			return OK;
-
-		while (namelen > 0 && name[namelen] != '^')
-			namelen--;
-
-		tag = TRUE;
-		namelen -= STRING_SIZE("refs/tags/");
-		name	+= STRING_SIZE("refs/tags/");
-
-	} else if (!strncmp(name, "refs/heads/", STRING_SIZE("refs/heads/"))) {
-		namelen -= STRING_SIZE("refs/heads/");
-		name	+= STRING_SIZE("refs/heads/");
-
-	} else if (!strcmp(name, "HEAD")) {
-		return OK;
-	}
-
-	refs = realloc(refs, sizeof(*refs) * (refs_size + 1));
-	if (!refs)
-		return ERR;
-
-	ref = &refs[refs_size++];
-	ref->name = malloc(namelen + 1);
-	if (!ref->name)
-		return ERR;
-
-	strncpy(ref->name, name, namelen);
-	ref->name[namelen] = 0;
-	ref->tag = tag;
-	string_copy(ref->id, id);
-
-	return OK;
-}
-
-static int read_properties(FILE *pipe, const char *separators, int (*read_property)(char *, int, char *, int))
-{
-	char buffer[BUFSIZ];
-	char *name;
-	int state = OK;
-
-	if (!pipe)
-		return ERR;
-
-	while (state == OK && (name = fgets(buffer, sizeof(buffer), pipe))) {
-		char *value;
-		size_t namelen;
-		size_t valuelen;
-
-		name = chomp_string(name);
-		namelen = strcspn(name, separators);
-
-		if (name[namelen]) {
-			name[namelen] = 0;
-			value = chomp_string(name + namelen + 1);
-			valuelen = strlen(value);
-
-		} else {
-			value = "";
-			valuelen = 0;
-		}
-
-		state = read_property(name, namelen, value, valuelen);
-	}
-
-	if (state != ERR && ferror(pipe))
-		state = ERR;
-
-	pclose(pipe);
-
-	return state;
-}
-
-static int load_refs(void)
-{
-	const char *cmd_env = getenv("TIG_LS_REMOTE");
-	const char *cmd = cmd_env && *cmd_env ? cmd_env : TIG_LS_REMOTE;
-
-	return read_properties(popen(cmd, "r"), "\t", read_ref);
-}
 
 #define __NORETURN __attribute__((__noreturn__))
 
@@ -1881,8 +1793,6 @@ int main(int argc, char *argv[])
 	struct view *view;
 	enum request request;
 	size_t i;
-
-	load_refs();
 
 	for (i = 0; i < ARRAY_SIZE(views) && (view = &views[i]); i++)
 		view->cmd_env = getenv(view->cmd_env);
