@@ -227,11 +227,6 @@ static enum line_type get_line_type(char *line)
 	return LINE_DEFAULT;
 }
 
-static inline int get_line_attr(enum line_type type)
-{
-	assert(type < ARRAY_SIZE(line_info));
-	return COLOR_PAIR(type) | line_info[type].attr;
-}
 
 struct line {
 	enum line_type type;
@@ -316,6 +311,48 @@ static void redraw_view(struct view *view)
 	wclear(view->win);
 	redraw_view_from(view, 0);
 }
+static void resize_display(void)
+{
+	int offset, i;
+	struct view *base = display[0];
+	struct view *view = display[1] ? display[1] : display[0];
+
+	getmaxyx(stdscr, base->height, base->width); /* Setup window dimensions */
+
+	base->height -= 1; /* Make room for the status window. */
+
+	if (view != base) {
+		view->width   = base->width; /* Horizontal split. */
+		view->height  = SCALE_SPLIT_VIEW(base->height);
+		base->height -= view->height;
+		view->height -= 1; /* Make room for the title bar. */
+	}
+
+	base->height -= 1;/* Make room for the title bar. */
+
+	offset = 0;
+
+	foreach_view (view, i) {
+		if (!view->win) {
+			view->win = newwin(view->height, 0, offset, 0);
+			scrollok(view->win, TRUE);
+			view->title = newwin(1, 0, offset + view->height, 0);
+
+		} else {
+			wresize(view->win, view->height, view->width);
+			mvwin(view->win,   offset, 0);
+			mvwin(view->title, offset + view->height, 0);
+		}
+
+		offset += view->height + 1;
+	}
+}
+
+static inline int get_line_attr(enum line_type type)
+{
+	assert(type < ARRAY_SIZE(line_info));
+	return COLOR_PAIR(type) | line_info[type].attr;
+}
 
 static void update_view_title(struct view *view)
 {
@@ -354,42 +391,6 @@ static void update_view_title(struct view *view)
 	wrefresh(view->title);
 }
 
-static void resize_display(void)
-{
-	int offset, i;
-	struct view *base = display[0];
-	struct view *view = display[1] ? display[1] : display[0];
-
-	getmaxyx(stdscr, base->height, base->width); /* Setup window dimensions */
-
-	base->height -= 1; /* Make room for the status window. */
-
-	if (view != base) {
-		view->width   = base->width; /* Horizontal split. */
-		view->height  = SCALE_SPLIT_VIEW(base->height);
-		base->height -= view->height;
-		view->height -= 1; /* Make room for the title bar. */
-	}
-
-	base->height -= 1;/* Make room for the title bar. */
-
-	offset = 0;
-
-	foreach_view (view, i) {
-		if (!view->win) {
-			view->win = newwin(view->height, 0, offset, 0);
-			scrollok(view->win, TRUE);
-			view->title = newwin(1, 0, offset + view->height, 0);
-
-		} else {
-			wresize(view->win, view->height, view->width);
-			mvwin(view->win,   offset, 0);
-			mvwin(view->title, offset + view->height, 0);
-		}
-
-		offset += view->height + 1;
-	}
-}
 
 static void redraw_display(void)
 {
@@ -673,76 +674,6 @@ static struct line* realloc_lines(struct view *view, size_t line_size)
 	view->line = tmp;
 	view->line_size = line_size;
 	return view->line;
-}
-
-static bool update_view(struct view *view)
-{
-	char buffer[BUFSIZ];
-	char *line;
-	unsigned long lines = view->height;
-	int redraw_from = -1;
-
-	if (!view->pipe)
-		return TRUE;
-
-	if (view->offset + view->height >= view->lines) /* Only redraw if lines are visible. */
-		redraw_from = view->lines - view->offset;
-
-	if (!realloc_lines(view, view->lines + lines))
-		goto alloc_error;
-
-	while ((line = fgets(buffer, sizeof(buffer), view->pipe))) {
-		int linelen = strlen(line);
-
-		if (linelen)
-			line[linelen - 1] = 0;
-
-		if (!view->ops->read(view, line))
-			goto alloc_error;
-
-		if (lines-- == 1)
-			break;
-	}
-
-	{
-		int digits;
-
-		lines = view->lines;
-		for (digits = 0; lines; digits++)
-			lines /= 10;
-
-		if (digits != view->digits) { /* Keep the displayed view in sync with line number scaling. */
-			view->digits = digits;
-			redraw_from = 0;
-		}
-	}
-
-	if (redraw_from >= 0) {
-		if (redraw_from > 0)
-			redraw_from--;
-
-		redraw_view_from(view, redraw_from);/* Incrementally draw avoids flickering. */
-	}
-
-	update_view_title(view);
-
-	if (ferror(view->pipe)) {
-		report("Failed to read: %s", strerror(errno));
-		goto end;
-
-	} else if (feof(view->pipe)) {
-		report("");
-		goto end;
-	}
-
-	return TRUE;
-
-alloc_error:
-	report("Allocation failure");
-
-end:
-	end_update(view);
-	return FALSE;
 }
 
 enum open_flags {
@@ -1051,79 +982,6 @@ static void open_view(struct view *prev, enum request request, enum open_flags f
 		update_view_title(view);
 }
 
-static int view_driver(struct view *view, enum request request)
-{
-	int i;
-
-	switch (request) {
-	case REQ_MOVE_UP:
-	case REQ_MOVE_DOWN:
-	case REQ_MOVE_PAGE_UP:
-	case REQ_MOVE_PAGE_DOWN:
-		break;
-
-	case REQ_SCROLL_LINE_DOWN:
-	case REQ_SCROLL_LINE_UP:
-	case REQ_SCROLL_PAGE_DOWN:
-	case REQ_SCROLL_PAGE_UP:
-		scroll_view(view, request);
-		break;
-
-	case REQ_VIEW_MAIN:
-	case REQ_VIEW_DIFF:
-	case REQ_VIEW_HELP:
-		open_view(view, request, OPEN_DEFAULT);
-		break;
-
-	case REQ_NEXT:
-	case REQ_PREVIOUS:
-		request = request == REQ_NEXT ? REQ_MOVE_DOWN : REQ_MOVE_UP;
-
-		if (view == VIEW(REQ_VIEW_DIFF) &&
-		    view->parent == VIEW(REQ_VIEW_MAIN)) {
-			bool redraw = display[1] == view;
-
-			view = view->parent;
-			move_view(view, request, redraw);
-			if (redraw)
-				update_view_title(view);
-		} else {
-			move_view(view, request, TRUE);
-			break;
-		}
-		/* Fall-through */
-
-	case REQ_ENTER:
-		if (!view->lines) {
-			report("Nothing to enter");
-			break;
-		}
-		return view->ops->enter(view, &view->line[view->lineno]);
-
-	case REQ_SHOW_VERSION:
-		report("%s (built %s)", VERSION, __DATE__);
-		return TRUE;
-
-	case REQ_VIEW_CLOSE:
-		if (view->parent && view->parent->parent != view->parent) {
-			memset(display, 0, sizeof(display));
-			current_view = 0;
-			display[current_view] = view->parent;
-			view->parent = view;
-			resize_display();
-			redraw_display();
-			break;
-		}
-		return FALSE;
-
-	default:
-		report("Unknown key, press 'h' for help"); /* An unknown key will show most commonly used commands. */
-		return TRUE;
-	}
-
-	return TRUE;
-}
-
 static bool pager_draw(struct view *view, struct line *line, unsigned int lineno)
 {
 	char *text = line->data;
@@ -1429,6 +1287,149 @@ static struct view_ops main_ops = {
 	main_read,
 	main_enter,
 };
+
+static int view_driver(struct view *view, enum request request)
+{
+	int i;
+
+	switch (request) {
+	case REQ_MOVE_UP:
+	case REQ_MOVE_DOWN:
+	case REQ_MOVE_PAGE_UP:
+	case REQ_MOVE_PAGE_DOWN:
+		break;
+
+	case REQ_SCROLL_LINE_DOWN:
+	case REQ_SCROLL_LINE_UP:
+	case REQ_SCROLL_PAGE_DOWN:
+	case REQ_SCROLL_PAGE_UP:
+		scroll_view(view, request);
+		break;
+
+	case REQ_VIEW_MAIN:
+	case REQ_VIEW_DIFF:
+	case REQ_VIEW_HELP:
+		open_view(view, request, OPEN_DEFAULT);
+		break;
+
+	case REQ_NEXT:
+	case REQ_PREVIOUS:
+		request = request == REQ_NEXT ? REQ_MOVE_DOWN : REQ_MOVE_UP;
+
+		if (view == VIEW(REQ_VIEW_DIFF) &&
+		    view->parent == VIEW(REQ_VIEW_MAIN)) {
+			bool redraw = display[1] == view;
+
+			view = view->parent;
+			move_view(view, request, redraw);
+			if (redraw)
+				update_view_title(view);
+		} else {
+			move_view(view, request, TRUE);
+			break;
+		}
+		/* Fall-through */
+
+	case REQ_ENTER:
+		if (!view->lines) {
+			report("Nothing to enter");
+			break;
+		}
+		return view->ops->enter(view, &view->line[view->lineno]);
+
+	case REQ_SHOW_VERSION:
+		report("%s (built %s)", VERSION, __DATE__);
+		return TRUE;
+
+	case REQ_VIEW_CLOSE:
+		if (view->parent && view->parent->parent != view->parent) {
+			memset(display, 0, sizeof(display));
+			current_view = 0;
+			display[current_view] = view->parent;
+			view->parent = view;
+			resize_display();
+			redraw_display();
+			break;
+		}
+		return FALSE;
+
+	default:
+		report("Unknown key, press 'h' for help"); /* An unknown key will show most commonly used commands. */
+		return TRUE;
+	}
+
+	return TRUE;
+}
+
+static bool update_view(struct view *view)
+{
+	char buffer[BUFSIZ];
+	char *line;
+	unsigned long lines = view->height;
+	int redraw_from = -1;
+
+	if (!view->pipe)
+		return TRUE;
+
+	if (view->offset + view->height >= view->lines) /* Only redraw if lines are visible. */
+		redraw_from = view->lines - view->offset;
+
+	if (!realloc_lines(view, view->lines + lines))
+		goto alloc_error;
+
+	while ((line = fgets(buffer, sizeof(buffer), view->pipe))) {
+		int linelen = strlen(line);
+
+		if (linelen)
+			line[linelen - 1] = 0;
+
+		if (!view->ops->read(view, line))
+			goto alloc_error;
+
+		if (lines-- == 1)
+			break;
+	}
+
+	{
+		int digits;
+
+		lines = view->lines;
+		for (digits = 0; lines; digits++)
+			lines /= 10;
+
+		if (digits != view->digits) { /* Keep the displayed view in sync with line number scaling. */
+			view->digits = digits;
+			redraw_from = 0;
+		}
+	}
+
+	if (redraw_from >= 0) {
+		if (redraw_from > 0)
+			redraw_from--;
+
+		redraw_view_from(view, redraw_from);/* Incrementally draw avoids flickering. */
+	}
+
+	update_view_title(view);
+
+	if (ferror(view->pipe)) {
+		report("Failed to read: %s", strerror(errno));
+		goto end;
+
+	} else if (feof(view->pipe)) {
+		report("");
+		goto end;
+	}
+
+	return TRUE;
+
+alloc_error:
+	report("Allocation failure");
+
+end:
+	end_update(view);
+	return FALSE;
+}
 
 static enum request get_request(int key)
 {
