@@ -736,12 +736,6 @@ static void redraw_view_from(struct view *view, int lineno)
 	wrefresh(view->win);
 }
 
-static void redraw_view(struct view *view)
-{
-	wclear(view->win);
-	redraw_view_from(view, 0);
-}
-
 static void do_scroll_view(struct view *view, int lines, bool redraw)
 {
 	view->offset += lines; /* The rendering expects the new offset. */
@@ -750,8 +744,8 @@ static void do_scroll_view(struct view *view, int lines, bool redraw)
 	assert(lines);
 
 	if (view->height < ABS(lines)) { /* Redraw the whole screen if scrolling is pointless. */
-		redraw_view(view);
-
+		wclear(view->win);
+		redraw_view_from(view, 0);
 	} else {
 		int line = lines > 0 ? view->height - lines : 0;
 		int end = line + ABS(lines);
@@ -976,45 +970,6 @@ static char* get_key(enum request request)
 	return buf;
 }
 
-static void load_help_page(void)
-{
-	char buf[BUFSIZ];
-	struct view *view = VIEW(REQ_VIEW_HELP);
-	int lines = ARRAY_SIZE(req_info) + 2;
-	int i;
-
-	if (view->lines > 0)
-		return;
-
-	for (i = 0; i < ARRAY_SIZE(req_info); i++)
-		if (!req_info[i].request)
-			lines++;
-
-	view->line = calloc(lines, sizeof(*view->line));
-	if (!view->line) {
-		report("Allocation failure");
-		return;
-	}
-
-	pager_read(view, "Quick reference for tig keybindings:");
-
-	for (i = 0; i < ARRAY_SIZE(req_info); i++) {
-		char *key;
-
-		if (!req_info[i].request) {
-			pager_read(view, "");
-			pager_read(view, req_info[i].help);
-			continue;
-		}
-
-		key = get_key(req_info[i].request);
-		if (!string_format(buf, "%-25s %s", key, req_info[i].help))
-			continue;
-
-		pager_read(view, buf);
-	}
-}
-
 static void resize_display(void)
 {
 	int offset, i;
@@ -1067,7 +1022,41 @@ static void open_view(struct view *prev, enum request request, enum open_flags f
 	}
 
 	if (view == VIEW(REQ_VIEW_HELP)) {
-		load_help_page();
+		char buf[BUFSIZ];
+		struct view *view = VIEW(REQ_VIEW_HELP);
+		int lines = ARRAY_SIZE(req_info) + 2;
+		int i;
+
+		if (view->lines > 0)
+			return;
+
+		for (i = 0; i < ARRAY_SIZE(req_info); i++)
+			if (!req_info[i].request)
+				lines++;
+
+		view->line = calloc(lines, sizeof(*view->line));
+		if (!view->line) {
+			report("Allocation failure");
+			return;
+		}
+
+		pager_read(view, "Quick reference for tig keybindings:");
+
+		for (i = 0; i < ARRAY_SIZE(req_info); i++) {
+			char *key;
+
+			if (!req_info[i].request) {
+				pager_read(view, "");
+				pager_read(view, req_info[i].help);
+				continue;
+			}
+
+			key = get_key(req_info[i].request);
+			if (!string_format(buf, "%-25s %s", key, req_info[i].help))
+				continue;
+
+			pager_read(view, buf);
+		}
 	} else if ((reload || strcmp(view->vid, view->id)) &&
 		   !begin_update(view)) {
 		report("Failed to load %s view", view->name);
@@ -1105,7 +1094,8 @@ static void open_view(struct view *prev, enum request request, enum open_flags f
 		wclear(view->win); /* Clear the old view and let the incremental updating refill the screen. */
 		report("");
 	} else {
-		redraw_view(view);
+		wclear(view->win);
+		redraw_view_from(view, 0);
 		report("");
 	}
 
@@ -1187,28 +1177,6 @@ static struct view_ops pager_ops = {
 	pager_enter,
 };
 
-static void init_colors(void)
-{
-	int default_bg = COLOR_BLACK;
-	int default_fg = COLOR_WHITE;
-	enum line_type type;
-
-	start_color();
-
-	if (use_default_colors() != ERR) {
-		default_bg = -1;
-		default_fg = -1;
-	}
-
-	for (type = 0; type < ARRAY_SIZE(line_info); type++) {
-		struct line_info *info = &line_info[type];
-		int bg = info->bg == COLOR_DEFAULT ? default_bg : info->bg;
-		int fg = info->fg == COLOR_DEFAULT ? default_fg : info->fg;
-
-		init_pair(type, fg, bg);
-	}
-}
-
 static void move_view(struct view *view, enum request request, bool redraw)
 {
 	int steps;
@@ -1277,17 +1245,6 @@ static void move_view(struct view *view, enum request request, bool redraw)
 	report("");
 }
 
-static void redraw_display(void)
-{
-	struct view *view;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(display) && (view = display[i]); i++) {
-		redraw_view(view);
-		update_view_title(view);
-	}
-}
-
 static int view_driver(struct view *view, enum request request)
 {
 	int i;
@@ -1348,7 +1305,14 @@ static int view_driver(struct view *view, enum request request)
 			display[current_view] = view->parent;
 			view->parent = view;
 			resize_display();
-			redraw_display();
+			struct view *view;
+			int i;
+
+			for (i = 0; i < ARRAY_SIZE(display) && (view = display[i]); i++) {
+				wclear(view->win);
+				redraw_view_from(view, 0);
+				update_view_title(view);
+			}
 			break;
 		}
 		return FALSE;
@@ -1363,70 +1327,6 @@ static int view_driver(struct view *view, enum request request)
 
 static bool update_view(struct view *view)
 {
-	char buffer[BUFSIZ];
-	char *line;
-	unsigned long lines = view->height;
-	int redraw_from = -1;
-
-	if (!view->pipe)
-		return TRUE;
-
-	if (view->offset + view->height >= view->lines) /* Only redraw if lines are visible. */
-		redraw_from = view->lines - view->offset;
-
-	if (!realloc_lines(view, view->lines + lines))
-		goto alloc_error;
-
-	while ((line = fgets(buffer, sizeof(buffer), view->pipe))) {
-		int linelen = strlen(line);
-
-		if (linelen)
-			line[linelen - 1] = 0;
-
-		if (!view->ops->read(view, line))
-			goto alloc_error;
-
-		if (lines-- == 1)
-			break;
-	}
-
-	int digits;
-
-	lines = view->lines;
-	for (digits = 0; lines; digits++)
-		lines /= 10;
-
-	if (digits != view->digits) { /* Keep the displayed view in sync with line number scaling. */
-		view->digits = digits;
-		redraw_from = 0;
-	}
-
-	if (redraw_from >= 0) {
-		if (redraw_from > 0)
-			redraw_from--;
-
-		redraw_view_from(view, redraw_from);/* Incrementally draw avoids flickering. */
-	}
-
-	update_view_title(view);
-
-	if (ferror(view->pipe)) {
-		report("Failed to read: %s", strerror(errno));
-		goto end;
-
-	} else if (feof(view->pipe)) {
-		report("");
-		goto end;
-	}
-
-	return TRUE;
-
-alloc_error:
-	report("Allocation failure");
-
-end:
-	end_update(view);
-	return FALSE;
 }
 
 static enum request get_request(int key)
@@ -1461,8 +1361,26 @@ int main(int argc, char *argv[])
 	noecho();       /* Don't echo input */
 	leaveok(stdscr, TRUE);
 
-	if (has_colors())
-		init_colors();
+	if (has_colors()) {
+		int default_bg = COLOR_BLACK;
+		int default_fg = COLOR_WHITE;
+		enum line_type type;
+
+		start_color();
+
+		if (use_default_colors() != ERR) {
+			default_bg = -1;
+			default_fg = -1;
+		}
+
+		for (type = 0; type < ARRAY_SIZE(line_info); type++) {
+			struct line_info *info = &line_info[type];
+			int bg = info->bg == COLOR_DEFAULT ? default_bg : info->bg;
+			int fg = info->fg == COLOR_DEFAULT ? default_fg : info->fg;
+
+			init_pair(type, fg, bg);
+		}
+	}
 
 	getmaxyx(stdscr, y, x);
 	status_win = newwin(1, 0, y - 1, 0);
@@ -1474,7 +1392,72 @@ int main(int argc, char *argv[])
 		int key;
 		int i;
 
-		for (i = 0; i < ARRAY_SIZE(display) && (view = display[i]); i++)
+		for (i = 0; i < ARRAY_SIZE(display) && (view = display[i]); i++) {
+		char buffer[BUFSIZ];
+		char *line;
+		unsigned long lines = view->height;
+		int redraw_from = -1;
+
+		if (!view->pipe)
+			break;
+
+		if (view->offset + view->height >= view->lines) /* Only redraw if lines are visible. */
+			redraw_from = view->lines - view->offset;
+
+		if (!realloc_lines(view, view->lines + lines))
+			goto alloc_error;
+
+		while ((line = fgets(buffer, sizeof(buffer), view->pipe))) {
+			int linelen = strlen(line);
+
+			if (linelen)
+				line[linelen - 1] = 0;
+
+			if (!view->ops->read(view, line))
+				goto alloc_error;
+
+			if (lines-- == 1)
+				break;
+		}
+
+		int digits;
+
+		lines = view->lines;
+		for (digits = 0; lines; digits++)
+			lines /= 10;
+
+		if (digits != view->digits) { /* Keep the displayed view in sync with line number scaling. */
+			view->digits = digits;
+			redraw_from = 0;
+		}
+
+		if (redraw_from >= 0) {
+			if (redraw_from > 0)
+				redraw_from--;
+
+			redraw_view_from(view, redraw_from);/* Incrementally draw avoids flickering. */
+		}
+
+		update_view_title(view);
+
+		if (ferror(view->pipe)) {
+			report("Failed to read: %s", strerror(errno));
+			goto end;
+
+		} else if (feof(view->pipe)) {
+			report("");
+			goto end;
+		}
+
+		break;
+
+	alloc_error:
+		report("Allocation failure");
+
+	end:
+		end_update(view);
+		break;
+		}
 			update_view(view);
 
 		key = wgetch(status_win); /* Refresh, accept single keystroke of input */
